@@ -3,14 +3,14 @@ import logging
 import os
 from dotenv import load_dotenv
 from livekit import rtc, api
-from pathlib import Path
 import sounddevice as sd
 import numpy as np
 import signal
 import queue
+from typing import Dict
 
 # Load environment variables
-load_dotenv(dotenv_path=Path(__file__).parent / '.env')
+load_dotenv()
 
 # Configuration
 SAMPLE_RATE = 48000  # LiveKit's preferred sample rate
@@ -34,21 +34,30 @@ async def main():
         logging.error("Please set LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET in your .env file.")
         return
 
+    # Prompt for room name
+    room_name = input("Enter the room name you want to join: ").strip()
+    if not room_name:
+        logging.error("Room name cannot be empty")
+        return
+
     # Create a LiveKit Room instance
     room = rtc.Room()
 
-    # Generate access token
+    # Generate access token with the provided room name
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity("python-voice-app")
         .with_grants(
             api.VideoGrants(
                 room_join=True,
-                room="my-room",
+                room=room_name,
             )
         )
         .to_jwt()
     )
+
+    # Dictionary to track audio tasks by track SID
+    audio_tasks: Dict[str, asyncio.Task] = {}
 
     # List to keep track of all background tasks
     background_tasks = set()
@@ -65,17 +74,31 @@ async def main():
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.Participant):
         logging.info(f"Participant disconnected: {participant.sid} {participant.identity}")
+        # Clean up any audio tasks for this participant's tracks
+        for publication in participant.track_publications.values():
+            if publication.sid in audio_tasks:
+                task = audio_tasks.pop(publication.sid)
+                task.cancel()
 
     # Event handler for track subscriptions
     @room.on("track_subscribed")
     def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
         asyncio.create_task(handle_track_subscribed(track, publication, participant))
 
+    # Event handler for track unsubscriptions
+    @room.on("track_unsubscribed")
+    def on_track_unsubscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
+        logging.info(f"Track unsubscribed: {publication.sid} from {participant.identity}")
+        if publication.sid in audio_tasks:
+            task = audio_tasks.pop(publication.sid)
+            task.cancel()
+
     async def handle_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
         logging.info(f"Track subscribed: {publication.sid} from {participant.identity}")
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             audio_stream = rtc.AudioStream(track)
             task = asyncio.create_task(play_audio(audio_stream))
+            audio_tasks[publication.sid] = task
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
 
